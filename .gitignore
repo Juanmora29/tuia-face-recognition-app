@@ -14,3 +14,4 @@ data/*
 *.jpeg
 *.jpg
 result-*
+lfw_*
