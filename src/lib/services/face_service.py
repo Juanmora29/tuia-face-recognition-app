@@ -13,7 +13,46 @@ from lib.storage.base import EmbeddingStoreProtocol
 import os 
 import logging
 
+import torch.nn as nn
+from torchvision import models, transforms
+from PIL import Image
+from insightface.app import FaceAnalysis
+from insightface.utils import face_align
+
 logger = logging.getLogger(__name__)
+
+# Definimos la misma arquitectura que en el notebook para poder cargar el state_dict
+class FaceRecognitionResNet(nn.Module):
+    def __init__(self, num_classes=71):
+        super(FaceRecognitionResNet, self).__init__()
+        self.backbone = models.resnet50(weights=None)
+        num_ftrs = self.backbone.fc.in_features
+        self.backbone.fc = nn.Sequential(
+            nn.Linear(num_ftrs, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(512, num_classes)
+        )
+        
+    def forward(self, x):
+        return self.backbone(x)
+        
+    def extract_embedding(self, x):
+        x = self.backbone.conv1(x)
+        x = self.backbone.bn1(x)
+        x = self.backbone.relu(x)
+        x = self.backbone.maxpool(x)
+        x = self.backbone.layer1(x)
+        x = self.backbone.layer2(x)
+        x = self.backbone.layer3(x)
+        x = self.backbone.layer4(x)
+        x = self.backbone.avgpool(x)
+        x = torch.flatten(x, 1)
+        x = self.backbone.fc[0](x)
+        x = self.backbone.fc[1](x)
+        x = torch.nn.functional.normalize(x, p=2, dim=1)
+        return x
 
 
 class FaceService:
@@ -34,6 +73,10 @@ class FaceService:
         self.output_path = output_path
 
         os.makedirs(self.output_path, exist_ok=True)
+        
+        # Inicializamos InsightFace para la detección y alineación
+        self.app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        self.app.prepare(ctx_id=-1)
 
     @staticmethod
     def _clip_xyxy(
@@ -65,7 +108,19 @@ class FaceService:
             raise ValueError(f"Model path does not exist: {model_path}")
         suf = mp.suffix.lower()
         if suf == ".pth":
-            return torch.load(mp, map_location="cpu", weights_only=False)
+            state_dict = torch.load(mp, map_location="cpu", weights_only=True)
+            
+            # Buscamos dinámicamente cuántas clases tiene el modelo guardado
+            # Miramos el tamaño de la matriz de la última capa (backbone.fc.4.weight)
+            # Su forma es [num_classes, 512]
+            num_classes = 71 # fallback por defecto
+            if "backbone.fc.4.weight" in state_dict:
+                num_classes = state_dict["backbone.fc.4.weight"].shape[0]
+            
+            model = FaceRecognitionResNet(num_classes=num_classes)
+            model.load_state_dict(state_dict)
+            model.eval()
+            return model
         if suf == ".onnx":
             return onnxruntime.InferenceSession(str(mp))
         raise ValueError(f"Unsupported model format (expected .pth or .onnx): {model_path}")
@@ -82,7 +137,14 @@ class FaceService:
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        raise NotImplementedError("Not implemented")
+        faces = self.app.get(image)
+        boxes = []
+        for face in faces:
+            if face.bbox is not None:
+                x1, y1, x2, y2 = face.bbox.astype(int)
+                x1, y1, x2, y2 = self._clip_xyxy(x1, y1, x2, y2, image.shape[0], image.shape[1])
+                boxes.append((x1, y1, x2, y2))
+        return boxes
 
 
     def align_face(
@@ -92,14 +154,42 @@ class FaceService:
         Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        raise NotImplementedError("Not implemented")
+        x1, y1, x2, y2 = box
+        crop = image[y1:y2, x1:x2]
+        
+        # Corremos insightface de nuevo pero solo en el recorte para asegurar encontrar los landmarks
+        faces = self.app.get(crop)
+        
+        if len(faces) > 0 and faces[0].kps is not None:
+            face = faces[0]
+            aligned_img = face_align.norm_crop(crop, landmark=face.kps, image_size=self.face_size)
+            return AlignedFace(bbox=box, keypoints=face.kps, image=aligned_img)
+            
+        # Fallback si no se detectan landmarks: simplemente redimensionamos el recorte
+        aligned_img = cv2.resize(crop, (self.face_size, self.face_size))
+        return AlignedFace(bbox=box, keypoints=None, image=aligned_img)
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        raise NotImplementedError("Not implemented")
+        # Convertimos BGR a RGB porque el modelo fue entrenado con transformaciones sobre PIL (RGB)
+        img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
+        
+        # Las mismas transformaciones de validación usadas en el notebook
+        val_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        img_tensor = val_transform(Image.fromarray(img_rgb)).unsqueeze(0) # Añadimos el batch dimension
+        
+        with torch.no_grad():
+            embedding_tensor = self.model.extract_embedding(img_tensor)
+            
+        # Devolvemos el embedding como una lista plana de floats
+        return embedding_tensor.squeeze(0).cpu().numpy().tolist()
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
