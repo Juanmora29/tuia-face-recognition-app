@@ -132,40 +132,35 @@ class FaceService:
         # BGR uint8 (InsightFace / OpenCV convention)
         return image
 
-    def detect_faces(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
+    def detect_faces(self, image: np.ndarray) -> list[tuple[tuple[int, int, int, int], np.ndarray | None]]:
         """
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
-        Return a list of tuples with the coordinates of the faces detected in the image.
+        Return a list of tuples with the bounding boxes and keypoints of the faces detected.
         """
         faces = self.app.get(image)
-        boxes = []
+        results = []
         for face in faces:
             if face.bbox is not None:
                 x1, y1, x2, y2 = face.bbox.astype(int)
                 x1, y1, x2, y2 = self._clip_xyxy(x1, y1, x2, y2, image.shape[0], image.shape[1])
-                boxes.append((x1, y1, x2, y2))
-        return boxes
+                results.append(((x1, y1, x2, y2), face.kps))
+        return results
 
 
     def align_face(
-        self, image: np.ndarray, box: tuple[int, int, int, int]
+        self, image: np.ndarray, box: tuple[int, int, int, int], kps: np.ndarray | None
     ) -> AlignedFace:
         """
-        Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
+        Align using keypoints.
         Return an AlignedFace object.
         """
-        x1, y1, x2, y2 = box
-        crop = image[y1:y2, x1:x2]
-        
-        # Corremos insightface de nuevo pero solo en el recorte para asegurar encontrar los landmarks
-        faces = self.app.get(crop)
-        
-        if len(faces) > 0 and faces[0].kps is not None:
-            face = faces[0]
-            aligned_img = face_align.norm_crop(crop, landmark=face.kps, image_size=self.face_size)
-            return AlignedFace(bbox=box, keypoints=face.kps, image=aligned_img)
+        if kps is not None:
+            aligned_img = face_align.norm_crop(image, landmark=kps, image_size=self.face_size)
+            return AlignedFace(bbox=box, keypoints=kps, image=aligned_img)
             
         # Fallback si no se detectan landmarks: simplemente redimensionamos el recorte
+        x1, y1, x2, y2 = box
+        crop = image[y1:y2, x1:x2]
         aligned_img = cv2.resize(crop, (self.face_size, self.face_size))
         return AlignedFace(bbox=box, keypoints=None, image=aligned_img)
 
@@ -234,10 +229,10 @@ class FaceService:
         if len(faces) != 1:
             raise ValueError("Exactly one face must be detected for identity registration.")
         
-        logger.info(f"Face detected: {faces[0]}")
+        box, kps = faces[0]
+        logger.info(f"Face detected: {box}")
 
-        box = faces[0]
-        aligned = self.align_face(image, box)
+        aligned = self.align_face(image, box, kps)
         embedding = self.extract_embedding_from_face(aligned)
 
         img_id = str(uuid4())
@@ -260,12 +255,18 @@ class FaceService:
         image = self._load_image(source_path)
         faces = self.detect_faces(image)
         detections: list[FaceDetection] = []
-        for (x1, y1, x2, y2) in faces:
-            aligned = self.align_face(image, (x1, y1, x2, y2))
+        for box, kps in faces:
+            x1, y1, x2, y2 = box
+            aligned = self.align_face(image, box, kps)
             embedding = self.extract_embedding_from_face(aligned)
             label, score = self.identify(embedding)
-            kps = getattr(aligned, "keypoints", None)
-            kps_arr = np.asarray(kps) if kps is not None else None
+            kps_attr = getattr(aligned, "keypoints", None)
+            if kps_attr is not None:
+                kps_arr = np.asarray(kps_attr).copy()
+                kps_arr[:, 0] -= x1
+                kps_arr[:, 1] -= y1
+            else:
+                kps_arr = None
             detections.append(
                 FaceDetection(
                     bbox=[x1, y1, x2, y2],
