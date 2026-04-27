@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Definimos la misma arquitectura que en el notebook para poder cargar el state_dict
 class FaceRecognitionResNet(nn.Module):
-    def __init__(self, num_classes=71):
+    def __init__(self):
         super(FaceRecognitionResNet, self).__init__()
         self.backbone = models.resnet50(weights=None)
         num_ftrs = self.backbone.fc.in_features
@@ -31,28 +31,17 @@ class FaceRecognitionResNet(nn.Module):
             nn.Linear(num_ftrs, 512),
             nn.BatchNorm1d(512),
             nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes)
+            nn.Dropout(0.5)
         )
         
     def forward(self, x):
-        return self.backbone(x)
+        # Normalizamos el embedding que sale de la red
+        x = self.backbone(x)
+        return torch.nn.functional.normalize(x, p=2, dim=1)
         
     def extract_embedding(self, x):
-        x = self.backbone.conv1(x)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
-        x = self.backbone.layer1(x)
-        x = self.backbone.layer2(x)
-        x = self.backbone.layer3(x)
-        x = self.backbone.layer4(x)
-        x = self.backbone.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.backbone.fc[0](x)
-        x = self.backbone.fc[1](x)
-        x = torch.nn.functional.normalize(x, p=2, dim=1)
-        return x
+        # En inferencia, usamos el forward que ya normaliza
+        return self.forward(x)
 
 
 class FaceService:
@@ -110,14 +99,7 @@ class FaceService:
         if suf == ".pth":
             state_dict = torch.load(mp, map_location="cpu", weights_only=True)
             
-            # Buscamos dinámicamente cuántas clases tiene el modelo guardado
-            # Miramos el tamaño de la matriz de la última capa (backbone.fc.4.weight)
-            # Su forma es [num_classes, 512]
-            num_classes = 71 # fallback por defecto
-            if "backbone.fc.4.weight" in state_dict:
-                num_classes = state_dict["backbone.fc.4.weight"].shape[0]
-            
-            model = FaceRecognitionResNet(num_classes=num_classes)
+            model = FaceRecognitionResNet()
             model.load_state_dict(state_dict)
             model.eval()
             return model
