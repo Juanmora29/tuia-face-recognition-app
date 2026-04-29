@@ -1,0 +1,14 @@
+torch
+torchvision
+insightface
+onnx
+onnxruntime
+onnxscript
+opencv-python-headless
+pillow
+numpy
+matplotlib
+pandas
+scikit-learn
+tqdm
+ipykernel

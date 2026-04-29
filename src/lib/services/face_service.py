@@ -35,6 +35,11 @@ class FaceService:
 
         os.makedirs(self.output_path, exist_ok=True)
 
+        # Inicializar InsightFace aquí para evitar demoras en la primera predicción
+        from insightface.app import FaceAnalysis
+        self.app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
+        self.app.prepare(ctx_id=-1, det_size=(640, 640))
+
     @staticmethod
     def _clip_xyxy(
         x1: int, y1: int, x2: int, y2: int, height: int, width: int
@@ -82,7 +87,17 @@ class FaceService:
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        raise NotImplementedError("Not implemented")
+        from insightface.app import FaceAnalysis
+        
+        faces = self.app.get(image)
+        self._cached_faces = faces
+        results = []
+        for face in faces:
+            if face.bbox is not None:
+                x1, y1, x2, y2 = face.bbox.astype(int)
+                x1, y1, x2, y2 = self._clip_xyxy(x1, y1, x2, y2, image.shape[0], image.shape[1])
+                results.append((x1, y1, x2, y2))
+        return results
 
 
     def align_face(
@@ -92,14 +107,82 @@ class FaceService:
         Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        raise NotImplementedError("Not implemented")
+        from insightface.app import FaceAnalysis
+        from insightface.utils import face_align
+        import cv2
+            
+        x1, y1, x2, y2 = box
+        
+        faces = getattr(self, '_cached_faces', None)
+        if faces is None:
+            faces = self.app.get(image)
+            
+        target_face = None
+        best_iou = 0.0
+        box_area = (x2 - x1) * (y2 - y1)
+        
+        for face in faces:
+            if face.bbox is None:
+                continue
+            fx1, fy1, fx2, fy2 = face.bbox
+            inter_x1 = max(x1, fx1)
+            inter_y1 = max(y1, fy1)
+            inter_x2 = min(x2, fx2)
+            inter_y2 = min(y2, fy2)
+            
+            if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+                inter_area = (inter_x2 - inter_x1) * (inter_y2 - inter_y1)
+                face_area = (fx2 - fx1) * (fy2 - fy1)
+                iou = inter_area / float(box_area + face_area - inter_area)
+                if iou > best_iou:
+                    best_iou = iou
+                    target_face = face
+                    
+        if target_face is None:
+            crop = image[y1:y2, x1:x2]
+            aligned_img = cv2.resize(crop, (self.face_size, self.face_size))
+            return AlignedFace(bbox=list(box), keypoints=None, image=aligned_img)
+            
+        aligned_img = face_align.norm_crop(image, landmark=target_face.kps, image_size=self.face_size)
+        
+        kps_relative = target_face.kps.copy()
+        kps_relative[:, 0] -= x1
+        kps_relative[:, 1] -= y1
+        
+        return AlignedFace(bbox=list(box), keypoints=kps_relative.tolist(), image=aligned_img)
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        raise NotImplementedError("Not implemented")
+        import torch
+        from torchvision import transforms
+        from PIL import Image
+        import cv2
+        
+        img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
+        
+        val_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        img_tensor = val_transform(Image.fromarray(img_rgb)).unsqueeze(0)
+        
+        if isinstance(self.model, onnxruntime.InferenceSession):
+            input_name = self.model.get_inputs()[0].name
+            # ONNX Runtime expects numpy arrays, not torch tensors
+            embedding_numpy = self.model.run(None, {input_name: img_tensor.numpy()})[0]
+            return embedding_numpy[0].tolist()
+        else:
+            if hasattr(self.model, 'eval'):
+                self.model.eval()
+                
+            with torch.no_grad():
+                embedding_tensor = self.model(img_tensor)
+                
+            return embedding_tensor.squeeze(0).cpu().numpy().tolist()
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
