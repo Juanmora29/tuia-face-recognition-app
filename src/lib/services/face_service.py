@@ -137,7 +137,9 @@ class FaceService:
                 h, w = image.shape[:2]
                 cx1, cy1, cx2, cy2 = self._clip_xyxy(x1, y1, x2, y2, h, w)
                 aligned_bgr = cv2.resize(image[cy1:cy2, cx1:cx2], (self.face_size, self.face_size))
-            kps_adj = best_face.kps
+            kps_adj = best_face.kps.copy()
+            kps_adj[:, 0] -= x1
+            kps_adj[:, 1] -= y1
         else:
             h, w = image.shape[:2]
             cx1, cy1, cx2, cy2 = self._clip_xyxy(x1, y1, x2, y2, h, w)
