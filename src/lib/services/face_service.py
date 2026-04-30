@@ -189,7 +189,9 @@ class FaceService:
                             num_ftrs = self.backbone.fc.in_features
                             self.backbone.fc = nn.Sequential(
                                 nn.Linear(num_ftrs, 512),
-                                nn.BatchNorm1d(512)
+                                nn.BatchNorm1d(512),
+                                nn.PReLU(),
+                                nn.Dropout(0.4)
                             )
                             
                         def forward(self, x):
