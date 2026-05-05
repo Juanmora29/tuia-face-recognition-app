@@ -7,9 +7,9 @@ output/*
 !output/.gitkeep
 model/*
 !model/.gitkeep
-*.pth
-*.onnx
 data/*
 .DS_Store
 result-*
 lfw_*
+*.pth
+*.onnx
