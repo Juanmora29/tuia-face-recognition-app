@@ -6,8 +6,9 @@ from uuid import uuid4
 
 import cv2
 import numpy as np
-import torch
-import onnxruntime
+import insightface
+from insightface.app import FaceAnalysis
+from insightface.utils import face_align
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
 import os 
@@ -30,7 +31,7 @@ class FaceService:
         self.similarity_metric = similarity_metric
         self.similarity_threshold = similarity_threshold
         self.face_size = face_size
-        self.model: any = self._load_model(model_path)
+        self.model = None # Custom model replaced by InsightFace
         self.output_path = output_path
 
         os.makedirs(self.output_path, exist_ok=True)
@@ -59,17 +60,6 @@ class FaceService:
         }
 
 
-    def _load_model(self, model_path: Path) -> any:
-        mp = Path(model_path)
-        if not mp.exists():
-            raise ValueError(f"Model path does not exist: {model_path}")
-        suf = mp.suffix.lower()
-        if suf == ".pth":
-            return torch.load(mp, map_location="cpu", weights_only=False)
-        if suf == ".onnx":
-            return onnxruntime.InferenceSession(str(mp))
-        raise ValueError(f"Unsupported model format (expected .pth or .onnx): {model_path}")
-
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(source_path)
         if image is None:
@@ -77,146 +67,87 @@ class FaceService:
         # BGR uint8 (InsightFace / OpenCV convention)
         return image
 
-    def detect_faces(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
+    def detect_faces(self, image: np.ndarray) -> list[any]:
         """
-        Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
-        Return a list of tuples with the coordinates of the faces detected in the image.
+        Detect faces in the image and return the full InsightFace objects.
+        This preserves landmarks for the alignment step.
         """
         if not hasattr(self, "_app"):
-            from insightface.app import FaceAnalysis
             self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
             self._app.prepare(ctx_id=0)
             
         faces = self._app.get(image)
         # Prioritize the largest detected face (sorting by area)
         faces = sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
-        return [tuple(map(int, face.bbox)) for face in faces]
+        return faces
 
     def align_face(
-        self, image: np.ndarray, box: tuple[int, int, int, int]
+        self, image: np.ndarray, face_obj: any
     ) -> AlignedFace:
         """
-        Crop using box (x1, y1, x2, y2) and run FaceAnalysis.
-        To maintain consistency with training, norm_crop is applied to the FULL image.
+        Align face using the provided detection object.
+        Using the landmarks already found during detection prevents fallback to cv2.resize.
         """
-        if not hasattr(self, "_app"):
-            from insightface.app import FaceAnalysis
-            self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-            self._app.prepare(ctx_id=0)
-        from insightface.utils import face_align
 
+        box = tuple(map(int, face_obj.bbox))
         x1, y1, x2, y2 = box
         
-        # Run detection on full image to get proper keypoints for norm_crop
-        faces = self._app.get(image)
-        
-        best_face = None
-        best_iou = 0.0
-        
-        def iou(b1, b2):
-            xx1 = max(b1[0], b2[0])
-            yy1 = max(b1[1], b2[1])
-            xx2 = min(b1[2], b2[2])
-            yy2 = min(b1[3], b2[3])
-            w = max(0, xx2 - xx1)
-            h = max(0, yy2 - yy1)
-            inter = w * h
-            area1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
-            area2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
-            return inter / float(area1 + area2 - inter + 1e-6)
+        # Predefined size to maintain consistency with training (112x112)
+        model_input_size = 112 
 
-        for face in faces:
-            score = iou(box, face.bbox)
-            if score > best_iou:
-                best_iou = score
-                best_face = face
-                
-        if best_face is not None and best_face.kps is not None:
-            aligned_bgr = face_align.norm_crop(image, landmark=best_face.kps, image_size=self.face_size)
+        if face_obj is not None and face_obj.kps is not None:
+            # High-quality alignment (Similarity Transform)
+            aligned_bgr = face_align.norm_crop(image, landmark=face_obj.kps, image_size=model_input_size)
+            
+            # If norm_crop fails, we still try to at least return the resized crop 
+            # but we log it as it's sub-optimal for recognition.
             if aligned_bgr is None or aligned_bgr.size == 0:
+                logger.warning("norm_crop returned empty image, falling back to resize.")
                 h, w = image.shape[:2]
                 cx1, cy1, cx2, cy2 = self._clip_xyxy(x1, y1, x2, y2, h, w)
-                aligned_bgr = cv2.resize(image[cy1:cy2, cx1:cx2], (self.face_size, self.face_size))
-            kps_adj = best_face.kps.copy()
+                aligned_bgr = cv2.resize(image[cy1:cy2, cx1:cx2], (model_input_size, model_input_size))
+            
+            kps_adj = face_obj.kps.copy()
             kps_adj[:, 0] -= x1
             kps_adj[:, 1] -= y1
         else:
+            # This should rarely happen now that we pass the detection object directly
+            logger.error(f"Alignment failed: No keypoints found for face at {box}. Using low-quality resize.")
             h, w = image.shape[:2]
             cx1, cy1, cx2, cy2 = self._clip_xyxy(x1, y1, x2, y2, h, w)
             crop = image[cy1:cy2, cx1:cx2]
             if crop.size == 0:
-                aligned_bgr = np.zeros((self.face_size, self.face_size, 3), dtype=np.uint8)
+                aligned_bgr = np.zeros((model_input_size, model_input_size, 3), dtype=np.uint8)
             else:
-                aligned_bgr = cv2.resize(crop, (self.face_size, self.face_size))
+                aligned_bgr = cv2.resize(crop, (model_input_size, model_input_size))
             kps_adj = None
             
-        return AlignedFace(bbox=box, keypoints=kps_adj, image=aligned_bgr)
+        embedding = face_obj.normed_embedding.tolist() if face_obj is not None and face_obj.normed_embedding is not None else None
+        return AlignedFace(bbox=box, keypoints=kps_adj, image=aligned_bgr, embedding=embedding)
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
-        Extract embedding from face.
-        Return a list of floats representing the embedding of the face.
+        Extract embedding from face using InsightFace's recognition model.
         """
-        from torchvision import transforms
-        from PIL import Image
+        if face.embedding is not None:
+            return face.embedding
 
-        val_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
+        # Fallback: if embedding is missing, compute it from the aligned image
+        if not hasattr(self, "_app"):
+            self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            self._app.prepare(ctx_id=0)
 
-        # InsightFace processes in BGR, we need RGB for the TorchVision preprocessing
-        img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
-        img_pil = Image.fromarray(img_rgb)
-        input_tensor = val_transform(img_pil).unsqueeze(0)
-
-        if isinstance(self.model, onnxruntime.InferenceSession):
-            input_name = self.model.get_inputs()[0].name
-            ort_inputs = {input_name: input_tensor.numpy()}
-            ort_outs = self.model.run(None, ort_inputs)
-            embedding = ort_outs[0][0].tolist()
-        else:
-            # Handle PyTorch state_dict (which is exported as a dictionary)
-            if isinstance(self.model, dict):
-                if not hasattr(self, "_pytorch_model"):
-                    from torchvision import models
-                    import torch.nn as nn
-                    
-                    class FaceRecognitionResNet(nn.Module):
-                        def __init__(self):
-                            super().__init__()
-                            self.backbone = models.resnet50(weights=None)
-                            num_ftrs = self.backbone.fc.in_features
-                            self.backbone.fc = nn.Sequential(
-                                nn.Linear(num_ftrs, 512),
-                                nn.BatchNorm1d(512),
-                                nn.PReLU(),
-                                nn.Dropout(0.4)
-                            )
-                            
-                        def forward(self, x):
-                            x = self.backbone(x)
-                            return torch.nn.functional.normalize(x, p=2, dim=1)
-                    
-                    m = FaceRecognitionResNet()
-                    m.load_state_dict(self.model)
-                    m.eval()
-                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    self._pytorch_model = m.to(device)
-                
-                model_to_use = self._pytorch_model
-            else:
-                # Fallback if it actually loaded as a full model
-                model_to_use = self.model
-                
-            device = next(model_to_use.parameters()).device
-            input_tensor = input_tensor.to(device)
-            model_to_use.eval()
-            with torch.no_grad():
-                out = model_to_use(input_tensor)
-                embedding = out[0].cpu().tolist()
-                
-        return embedding
+        # InsightFace recognition models expect BGR 112x112 images.
+        # We can reach into the loaded models to run recognition directly on the aligned image.
+        if 'recognition' in self._app.models:
+            # face.image is already BGR and 112x112 from align_face
+            embedding = self._app.models['recognition'].get(face.image, face)
+            if isinstance(embedding, np.ndarray):
+                return embedding.tolist()
+            return embedding
+        
+        logger.error("InsightFace recognition model not found in FaceAnalysis app.")
+        return []
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
@@ -263,8 +194,11 @@ class FaceService:
         
         logger.info(f"Face detected: {faces[0]}")
 
-        box = faces[0]
-        aligned = self.align_face(image, box)
+        face_obj = faces[0]
+        if face_obj.kps is None:
+            raise ValueError("No landmarks detected. High-quality alignment is required for identity registration.")
+            
+        aligned = self.align_face(image, face_obj)
         embedding = self.extract_embedding_from_face(aligned)
 
         img_id = str(uuid4())
@@ -287,10 +221,12 @@ class FaceService:
         image = self._load_image(source_path)
         faces = self.detect_faces(image)
         detections: list[FaceDetection] = []
-        for (x1, y1, x2, y2) in faces:
-            aligned = self.align_face(image, (x1, y1, x2, y2))
+        for face_obj in faces:
+            aligned = self.align_face(image, face_obj)
             embedding = self.extract_embedding_from_face(aligned)
             label, score = self.identify(embedding)
+            
+            x1, y1, x2, y2 = map(int, face_obj.bbox)
             kps = getattr(aligned, "keypoints", None)
             kps_arr = np.asarray(kps) if kps is not None else None
             detections.append(
