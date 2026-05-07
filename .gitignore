@@ -13,3 +13,6 @@ result-*
 lfw_*
 *.pth
 *.onnx
+.agents/
+.agents
+skills-lock.json
