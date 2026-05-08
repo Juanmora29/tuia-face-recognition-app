@@ -11,7 +11,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
 import torchvision.models as models
-import torch.nn as nn
 from PIL import Image
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
@@ -109,6 +108,17 @@ class FaceService:
         # BGR uint8 (InsightFace / OpenCV convention)
         return image
 
+    def _get_face_analyzer_ctx_id(self) -> int:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                logger.info("CUDA available, using GPU for face detection")
+                return 0
+        except Exception:
+            pass
+        logger.info("No CUDA available, using CPU for face detection")
+        return -1
+
     def detect_faces(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
         """
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
@@ -117,7 +127,8 @@ class FaceService:
         if self._app is None:
             from insightface.app import FaceAnalysis
             self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-            self._app.prepare(ctx_id=0)
+            ctx_id = self._get_face_analyzer_ctx_id()
+            self._app.prepare(ctx_id=ctx_id)
 
         faces = self._app.get(image)
 
@@ -138,7 +149,8 @@ class FaceService:
         if self._app is None:
             from insightface.app import FaceAnalysis
             self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-            self._app.prepare(ctx_id=0)
+            ctx_id = self._get_face_analyzer_ctx_id()
+            self._app.prepare(ctx_id=ctx_id)
         from insightface.utils import face_align
 
         x1, y1, x2, y2 = box
