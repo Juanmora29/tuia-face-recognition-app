@@ -7,7 +7,6 @@ from uuid import uuid4
 import cv2
 import numpy as np
 import torch
-import onnxruntime
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
 import os 
@@ -63,12 +62,9 @@ class FaceService:
         mp = Path(model_path)
         if not mp.exists():
             raise ValueError(f"Model path does not exist: {model_path}")
-        suf = mp.suffix.lower()
-        if suf == ".pth":
-            return torch.load(mp, map_location="cpu", weights_only=False)
-        if suf == ".onnx":
-            return onnxruntime.InferenceSession(str(mp))
-        raise ValueError(f"Unsupported model format (expected .pth or .onnx): {model_path}")
+        if mp.suffix.lower() != ".pth":
+            raise ValueError(f"Unsupported model format (expected .pth): {model_path}")
+        return torch.load(mp, map_location="cpu", weights_only=False)
 
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(source_path)
@@ -86,23 +82,22 @@ class FaceService:
             from insightface.app import FaceAnalysis
             self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
             self._app.prepare(ctx_id=0)
-            
+
         faces = self._app.get(image)
 
-        # Optimizacion: Cacheamos las caras para evitar re-deteccion en align_face
         self._cached_image_id = id(image)
         self._cached_faces = faces
 
-        # Prioritize the largest detected face (sorting by area)
         faces = sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
         return [tuple(map(int, face.bbox)) for face in faces]
+
 
     def align_face(
         self, image: np.ndarray, box: tuple[int, int, int, int]
     ) -> AlignedFace:
         """
-        Crop using box (x1, y1, x2, y2) and run FaceAnalysis.
-        To maintain consistency with training, norm_crop is applied to the FULL image.
+        Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
+        Return an AlignedFace object.
         """
         if not hasattr(self, "_app"):
             from insightface.app import FaceAnalysis
@@ -111,16 +106,15 @@ class FaceService:
         from insightface.utils import face_align
 
         x1, y1, x2, y2 = box
-        
-        # Optimizacion: Usamos las caras detectadas en detect_faces si es la misma imagen
+
         if hasattr(self, "_cached_image_id") and self._cached_image_id == id(image):
             faces = self._cached_faces
         else:
             faces = self._app.get(image)
-        
+
         best_face = None
         best_iou = 0.0
-        
+
         def iou(b1, b2):
             xx1 = max(b1[0], b2[0])
             yy1 = max(b1[1], b2[1])
@@ -138,46 +132,38 @@ class FaceService:
             if score > best_iou:
                 best_iou = score
                 best_face = face
-                
+
         if best_face is not None and best_face.kps is not None:
             aligned_bgr = face_align.norm_crop(image, landmark=best_face.kps, image_size=self.face_size)
-            
-            # Fallback mejorado: Si norm_crop falla, hacemos un recorte cuadrado centrado
             if aligned_bgr is None or aligned_bgr.size == 0:
                 h, w = image.shape[:2]
                 bw, bh = x2 - x1, y2 - y1
                 cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-                side = int(max(bw, bh) * 1.2) # Un poco más de margen
-                
+                side = int(max(bw, bh) * 1.2)
                 nx1 = max(0, cx - side // 2)
                 ny1 = max(0, cy - side // 2)
                 nx2 = min(w, nx1 + side)
                 ny2 = min(h, ny1 + side)
-                
                 aligned_bgr = cv2.resize(image[ny1:ny2, nx1:nx2], (self.face_size, self.face_size))
-                
             kps_adj = best_face.kps.copy()
             kps_adj[:, 0] -= x1
             kps_adj[:, 1] -= y1
         else:
-            # Fallback para cuando no hay landmarks: Recorte cuadrado centrado
             h, w = image.shape[:2]
             bw, bh = x2 - x1, y2 - y1
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             side = int(max(bw, bh) * 1.2)
-            
             nx1 = max(0, cx - side // 2)
             ny1 = max(0, cy - side // 2)
             nx2 = min(w, nx1 + side)
             ny2 = min(h, ny1 + side)
-            
             crop = image[ny1:ny2, nx1:nx2]
             if crop.size == 0:
                 aligned_bgr = np.zeros((self.face_size, self.face_size, 3), dtype=np.uint8)
             else:
                 aligned_bgr = cv2.resize(crop, (self.face_size, self.face_size))
             kps_adj = None
-            
+
         return AlignedFace(bbox=box, keypoints=kps_adj, image=aligned_bgr)
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
@@ -186,6 +172,8 @@ class FaceService:
         Return a list of floats representing the embedding of the face.
         """
         from torchvision import transforms
+        from torchvision import models
+        import torch.nn as nn
         from PIL import Image
 
         val_transform = transforms.Compose([
@@ -193,57 +181,39 @@ class FaceService:
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
 
-        # InsightFace processes in BGR, we need RGB for the TorchVision preprocessing
         img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
         input_tensor = val_transform(img_pil).unsqueeze(0)
 
-        if isinstance(self.model, onnxruntime.InferenceSession):
-            input_name = self.model.get_inputs()[0].name
-            ort_inputs = {input_name: input_tensor.numpy()}
-            ort_outs = self.model.run(None, ort_inputs)
-            embedding = ort_outs[0][0].tolist()
-        else:
-            # Handle PyTorch state_dict
-            if isinstance(self.model, dict):
-                if not hasattr(self, "_pytorch_model"):
-                    from torchvision import models
-                    import torch.nn as nn
-                    
-                    class FaceRecognitionEfficientNet(nn.Module):
-                        def __init__(self):
-                            super().__init__()
-                            # EfficientNet B0: Coincidente con train.ipynb
-                            self.backbone = models.efficientnet_b0(weights=None)
-                            num_ftrs = self.backbone.classifier[1].in_features
-                            self.backbone.classifier = nn.Sequential(
-                                nn.Linear(num_ftrs, 512),
-                                nn.BatchNorm1d(512),
-                                nn.PReLU(),
-                                nn.Dropout(0.5)
-                            )
-                            
-                        def forward(self, x):
-                            x = self.backbone(x)
-                            return torch.nn.functional.normalize(x, p=2, dim=1)
-                    
-                    m = FaceRecognitionEfficientNet()
-                    m.load_state_dict(self.model)
-                    m.eval()
-                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    self._pytorch_model = m.to(device)
-                
-                model_to_use = self._pytorch_model
-            else:
-                model_to_use = self.model
-                
-            device = next(model_to_use.parameters()).device
-            input_tensor = input_tensor.to(device)
-            model_to_use.eval()
-            with torch.no_grad():
-                out = model_to_use(input_tensor)
-                embedding = out[0].cpu().tolist()
-                
+        if not hasattr(self, "_pytorch_model"):
+            class FaceRecognitionEfficientNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.backbone = models.efficientnet_b0(weights=None)
+                    num_ftrs = self.backbone.classifier[1].in_features
+                    self.backbone.classifier = nn.Sequential(
+                        nn.Linear(num_ftrs, 512),
+                        nn.BatchNorm1d(512),
+                        nn.PReLU(),
+                        nn.Dropout(0.5)
+                    )
+
+                def forward(self, x):
+                    x = self.backbone(x)
+                    return torch.nn.functional.normalize(x, p=2, dim=1)
+
+            m = FaceRecognitionEfficientNet()
+            m.load_state_dict(self.model)
+            m.eval()
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self._pytorch_model = m.to(device)
+
+        input_tensor = input_tensor.to(next(self._pytorch_model.parameters()).device)
+        self._pytorch_model.eval()
+        with torch.no_grad():
+            out = self._pytorch_model(input_tensor)
+            embedding = out[0].cpu().tolist()
+
         return embedding
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
