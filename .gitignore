@@ -16,3 +16,4 @@ lfw_*
 .agents/
 .agents
 skills-lock.json
+src/data/celebrities/
