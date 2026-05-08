@@ -7,9 +7,15 @@ from uuid import uuid4
 import cv2
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import torchvision.models as models
+import torch.nn as nn
+from PIL import Image
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
-import os 
+import os
 import logging
 
 logger = logging.getLogger(__name__)
@@ -32,7 +38,37 @@ class FaceService:
         self.model: any = self._load_model(model_path)
         self.output_path = output_path
 
+        self.val_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        self._pytorch_model = self._build_pytorch_model()
+        self._app = None
+
         os.makedirs(self.output_path, exist_ok=True)
+
+    def _build_pytorch_model(self) -> nn.Module:
+        class FaceRecognitionEfficientNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.backbone = models.efficientnet_b0(weights=None)
+                num_ftrs = self.backbone.classifier[1].in_features
+                self.backbone.classifier = nn.Sequential(
+                    nn.Linear(num_ftrs, 512),
+                    nn.BatchNorm1d(512),
+                    nn.PReLU(),
+                    nn.Dropout(0.5)
+                )
+
+            def forward(self, x):
+                x = self.backbone(x)
+                return F.normalize(x, p=2, dim=1)
+
+        m = FaceRecognitionEfficientNet()
+        m.load_state_dict(self.model)
+        m.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return m.to(device)
 
     @staticmethod
     def _clip_xyxy(
@@ -78,7 +114,7 @@ class FaceService:
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        if not hasattr(self, "_app"):
+        if self._app is None:
             from insightface.app import FaceAnalysis
             self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
             self._app.prepare(ctx_id=0)
@@ -99,7 +135,7 @@ class FaceService:
         Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        if not hasattr(self, "_app"):
+        if self._app is None:
             from insightface.app import FaceAnalysis
             self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
             self._app.prepare(ctx_id=0)
@@ -171,42 +207,9 @@ class FaceService:
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        from torchvision import transforms
-        from torchvision import models
-        import torch.nn as nn
-        from PIL import Image
-
-        val_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-
         img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
-        input_tensor = val_transform(img_pil).unsqueeze(0)
-
-        if not hasattr(self, "_pytorch_model"):
-            class FaceRecognitionEfficientNet(nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.backbone = models.efficientnet_b0(weights=None)
-                    num_ftrs = self.backbone.classifier[1].in_features
-                    self.backbone.classifier = nn.Sequential(
-                        nn.Linear(num_ftrs, 512),
-                        nn.BatchNorm1d(512),
-                        nn.PReLU(),
-                        nn.Dropout(0.5)
-                    )
-
-                def forward(self, x):
-                    x = self.backbone(x)
-                    return torch.nn.functional.normalize(x, p=2, dim=1)
-
-            m = FaceRecognitionEfficientNet()
-            m.load_state_dict(self.model)
-            m.eval()
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self._pytorch_model = m.to(device)
+        input_tensor = self.val_transform(img_pil).unsqueeze(0)
 
         input_tensor = input_tensor.to(next(self._pytorch_model.parameters()).device)
         self._pytorch_model.eval()
