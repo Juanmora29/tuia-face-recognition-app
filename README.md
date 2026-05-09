@@ -56,8 +56,6 @@ tp1/
 
 Entrena tu modelo y guardalo dentro de la carpeta models. Por defecto, el modulo soporta modelos construidos con pytorch validando la extension **.pth**.
 
-Si eligen utilizar otro framework, pueden exportarlo a formato **.onnx**
-
 Recuerda actulizar las configuraciones del .env correspondiente para actualizar la ruta hacia tu modelo.
 
 El entorno local con o sin docker reinicia la aplicacion y actualiza el codigo automaticamente si uitlizan docker compose. 
