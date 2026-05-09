@@ -49,7 +49,6 @@ packaging==26.1
 pandas==3.0.2
 pgvector==0.4.2
 pillow==12.2.0
-plotly==5.22.0
 prettytable==3.17.0
 protobuf==7.34.1
 psycopg==3.3.3
@@ -96,4 +95,3 @@ uvloop==0.22.1
 watchfiles==1.1.1
 wcwidth==0.6.0
 websockets==16.0
-nbformat==4.2.0

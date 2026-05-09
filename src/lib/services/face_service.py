@@ -13,46 +13,7 @@ from lib.storage.base import EmbeddingStoreProtocol
 import os 
 import logging
 
-import torch.nn as nn
-from torchvision import models, transforms
-from PIL import Image
-from insightface.app import FaceAnalysis
-from insightface.utils import face_align
-
 logger = logging.getLogger(__name__)
-
-# Definimos la misma arquitectura que en el notebook para poder cargar el state_dict
-class FaceRecognitionResNet(nn.Module):
-    def __init__(self, num_classes=71):
-        super(FaceRecognitionResNet, self).__init__()
-        self.backbone = models.resnet50(weights=None)
-        num_ftrs = self.backbone.fc.in_features
-        self.backbone.fc = nn.Sequential(
-            nn.Linear(num_ftrs, 512),
-            nn.BatchNorm1d(512),
-            nn.ReLU(),
-            nn.Dropout(0.5),
-            nn.Linear(512, num_classes)
-        )
-        
-    def forward(self, x):
-        return self.backbone(x)
-        
-    def extract_embedding(self, x):
-        x = self.backbone.conv1(x)
-        x = self.backbone.bn1(x)
-        x = self.backbone.relu(x)
-        x = self.backbone.maxpool(x)
-        x = self.backbone.layer1(x)
-        x = self.backbone.layer2(x)
-        x = self.backbone.layer3(x)
-        x = self.backbone.layer4(x)
-        x = self.backbone.avgpool(x)
-        x = torch.flatten(x, 1)
-        x = self.backbone.fc[0](x)
-        x = self.backbone.fc[1](x)
-        x = torch.nn.functional.normalize(x, p=2, dim=1)
-        return x
 
 
 class FaceService:
@@ -73,10 +34,6 @@ class FaceService:
         self.output_path = output_path
 
         os.makedirs(self.output_path, exist_ok=True)
-        
-        # Inicializamos InsightFace para la detección y alineación
-        self.app = FaceAnalysis(name='buffalo_l', providers=['CPUExecutionProvider'])
-        self.app.prepare(ctx_id=-1)
 
     @staticmethod
     def _clip_xyxy(
@@ -108,19 +65,7 @@ class FaceService:
             raise ValueError(f"Model path does not exist: {model_path}")
         suf = mp.suffix.lower()
         if suf == ".pth":
-            state_dict = torch.load(mp, map_location="cpu", weights_only=True)
-            
-            # Buscamos dinámicamente cuántas clases tiene el modelo guardado
-            # Miramos el tamaño de la matriz de la última capa (backbone.fc.4.weight)
-            # Su forma es [num_classes, 512]
-            num_classes = 71 # fallback por defecto
-            if "backbone.fc.4.weight" in state_dict:
-                num_classes = state_dict["backbone.fc.4.weight"].shape[0]
-            
-            model = FaceRecognitionResNet(num_classes=num_classes)
-            model.load_state_dict(state_dict)
-            model.eval()
-            return model
+            return torch.load(mp, map_location="cpu", weights_only=False)
         if suf == ".onnx":
             return onnxruntime.InferenceSession(str(mp))
         raise ValueError(f"Unsupported model format (expected .pth or .onnx): {model_path}")
@@ -132,59 +77,29 @@ class FaceService:
         # BGR uint8 (InsightFace / OpenCV convention)
         return image
 
-    def detect_faces(self, image: np.ndarray) -> list[tuple[tuple[int, int, int, int], np.ndarray | None]]:
+    def detect_faces(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
         """
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
-        Return a list of tuples with the bounding boxes and keypoints of the faces detected.
+        Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        faces = self.app.get(image)
-        results = []
-        for face in faces:
-            if face.bbox is not None:
-                x1, y1, x2, y2 = face.bbox.astype(int)
-                x1, y1, x2, y2 = self._clip_xyxy(x1, y1, x2, y2, image.shape[0], image.shape[1])
-                results.append(((x1, y1, x2, y2), face.kps))
-        return results
+        raise NotImplementedError("Not implemented")
 
 
     def align_face(
-        self, image: np.ndarray, box: tuple[int, int, int, int], kps: np.ndarray | None
+        self, image: np.ndarray, box: tuple[int, int, int, int]
     ) -> AlignedFace:
         """
-        Align using keypoints.
+        Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
         Return an AlignedFace object.
         """
-        if kps is not None:
-            aligned_img = face_align.norm_crop(image, landmark=kps, image_size=self.face_size)
-            return AlignedFace(bbox=box, keypoints=kps, image=aligned_img)
-            
-        # Fallback si no se detectan landmarks: simplemente redimensionamos el recorte
-        x1, y1, x2, y2 = box
-        crop = image[y1:y2, x1:x2]
-        aligned_img = cv2.resize(crop, (self.face_size, self.face_size))
-        return AlignedFace(bbox=box, keypoints=None, image=aligned_img)
+        raise NotImplementedError("Not implemented")
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
         """
-        # Convertimos BGR a RGB porque el modelo fue entrenado con transformaciones sobre PIL (RGB)
-        img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
-        
-        # Las mismas transformaciones de validación usadas en el notebook
-        val_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        img_tensor = val_transform(Image.fromarray(img_rgb)).unsqueeze(0) # Añadimos el batch dimension
-        
-        with torch.no_grad():
-            embedding_tensor = self.model.extract_embedding(img_tensor)
-            
-        # Devolvemos el embedding como una lista plana de floats
-        return embedding_tensor.squeeze(0).cpu().numpy().tolist()
+        raise NotImplementedError("Not implemented")
         
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
@@ -229,10 +144,10 @@ class FaceService:
         if len(faces) != 1:
             raise ValueError("Exactly one face must be detected for identity registration.")
         
-        box, kps = faces[0]
-        logger.info(f"Face detected: {box}")
+        logger.info(f"Face detected: {faces[0]}")
 
-        aligned = self.align_face(image, box, kps)
+        box = faces[0]
+        aligned = self.align_face(image, box)
         embedding = self.extract_embedding_from_face(aligned)
 
         img_id = str(uuid4())
@@ -255,18 +170,12 @@ class FaceService:
         image = self._load_image(source_path)
         faces = self.detect_faces(image)
         detections: list[FaceDetection] = []
-        for box, kps in faces:
-            x1, y1, x2, y2 = box
-            aligned = self.align_face(image, box, kps)
+        for (x1, y1, x2, y2) in faces:
+            aligned = self.align_face(image, (x1, y1, x2, y2))
             embedding = self.extract_embedding_from_face(aligned)
             label, score = self.identify(embedding)
-            kps_attr = getattr(aligned, "keypoints", None)
-            if kps_attr is not None:
-                kps_arr = np.asarray(kps_attr).copy()
-                kps_arr[:, 0] -= x1
-                kps_arr[:, 1] -= y1
-            else:
-                kps_arr = None
+            kps = getattr(aligned, "keypoints", None)
+            kps_arr = np.asarray(kps) if kps is not None else None
             detections.append(
                 FaceDetection(
                     bbox=[x1, y1, x2, y2],

@@ -129,14 +129,8 @@ uvicorn frontend.app:app --port 8080
 Asegurate de configurar el archivo *.env.local.example* para que se adapte a tus necesidades.
 
 ```bash
-# 1. Asegúrate de tener el entorno virtual activado (como estás en src, usas ../)
-source ../.venv/bin/activate
-
-# 2. Copiamos el modelo y el archivo de variables de entorno
 cp ../models/<YOUR MODEL NAME>.pth models
-cp ../.env.local.example .env
-
-# 3. Levantamos el servidor
+cp ../.env.local.example src/.env
 uvicorn app.main:app --reload --port 8000 
 ```
 

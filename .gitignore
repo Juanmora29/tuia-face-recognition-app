@@ -11,5 +11,4 @@ model/*
 *.onnx
 data/*
 .DS_Store
-result-*
-lfw_*
+.agents/
