@@ -54,13 +54,13 @@ tp1/
 
 ## Configura tu modelo
 
-Entrena tu modelo y guardalo dentro de la carpeta models. Por defecto, el modulo soporta modelos construidos con pytorch validando la extension **.pth**.
+Entrena tu modelo y guardalo dentro de la carpeta models. Por defecto, el modulo soporta modelos construidos con pytorch validando la extension **.pth**. Los requerimientos necesarios para la notebook de train se encuentran en el archivo **requirements-nb-train.txt**.
 
 Recuerda actulizar las configuraciones del .env correspondiente para actualizar la ruta hacia tu modelo.
 
-El entorno local con o sin docker reinicia la aplicacion y actualiza el codigo automaticamente si uitlizan docker compose. 
+El entorno local con o sin docker reinicia la aplicacion y actualiza el codigo automaticamente si utilizan docker compose. 
 
-Puede que el reinicio automatico no funcione en todas las versiones de Docker Desktop en sistemas *Windows*, en tal caso deberan correr los comandos como se mencionan en el siguiente apartado para actualizar el codigo dentro de docker.
+Puede que el reinicio automático no funcione en todas las versiones de Docker Desktop en sistemas *Windows*, en tal caso deberan correr los comandos como se mencionan en el siguiente apartado para actualizar el codigo dentro de docker.
 
 ## Opcion 1 - Corriendo dentro de docker
 
