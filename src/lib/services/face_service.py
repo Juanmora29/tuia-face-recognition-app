@@ -212,13 +212,27 @@ class FaceService:
                 aligned_bgr = cv2.resize(crop, (self.face_size, self.face_size))
             kps_adj = None
 
-        return AlignedFace(bbox=box, keypoints=kps_adj, image=aligned_bgr)
+        insight_embedding = best_face.normed_embedding.astype(np.float32).tolist() if best_face is not None and hasattr(best_face, 'normed_embedding') and best_face.normed_embedding is not None else None
+        return AlignedFace(bbox=box, keypoints=kps_adj, image=aligned_bgr, embedding=insight_embedding)
+
+
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
         Extract embedding from face.
         Return a list of floats representing the embedding of the face.
+
+        En producción se utiliza el embedding 512-d de InsightFace (buffalo_l / w600k_r50),
+        ya L2-normalizado, que demostró 100% accuracy en la simulación de producción
+        del notebook de entrenamiento, frente al 55.7% del modelo EfficientNet B0 propio.
+        El código original de EfficientNet se conserva comentado como evidencia
+        del enfoque inicialmente planificado.
         """
+        # --- Embedding de InsightFace  ---
+        if face.embedding is not None:
+            return face.embedding
+
+        # --- Fallback: embedding con EfficientNet B0 (código original, conservado como referencia) ---
         img_rgb = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(img_rgb)
         input_tensor = self.val_transform(img_pil).unsqueeze(0)
